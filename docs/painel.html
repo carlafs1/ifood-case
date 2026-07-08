@@ -82,7 +82,7 @@ th{color:var(--soft);text-transform:uppercase;font-size:10.5px;letter-spacing:.0
 <div class="container">
   <header class="nav">
     <a class="brand" href="#">Carla Sampaio</a>
-    <a class="back" href="https://carlafs1.github.io/">← Voltar ao site</a>
+    <a class="back" href="https://carlasampaio.com.br">← Voltar ao site</a>
   </header>
 
   <section class="hero">
@@ -95,8 +95,17 @@ th{color:var(--soft);text-transform:uppercase;font-size:10.5px;letter-spacing:.0
 
   <div class="grid-two">
     <div class="panel-card">
-      <h2>Média de total_amount por mês</h2>
-      <div class="subtitle">Yellow Cab, jan–mai/2023</div>
+      <div style="display:flex;align-items:start;justify-content:space-between;gap:12px;flex-wrap:wrap">
+        <div>
+          <h2>Média de total_amount por mês</h2>
+          <div class="subtitle" id="chart-amount-subtitle">Yellow Cab, jan–mai/2023</div>
+        </div>
+        <select id="tipo-select" style="border:1px solid var(--line);border-radius:4px;padding:6px 10px;font-size:12px;color:var(--muted);background:var(--panel)">
+          <option value="yellow" selected>Yellow Cab</option>
+          <option value="green">Green Cab</option>
+          <option value="todos">Todos os tipos</option>
+        </select>
+      </div>
       <div class="chart-wrap"><canvas id="chart-amount"></canvas></div>
     </div>
     <div class="panel-card">
@@ -109,8 +118,26 @@ th{color:var(--soft);text-transform:uppercase;font-size:10.5px;letter-spacing:.0
   <section class="adhoc">
     <div class="adhoc-header">
       <div>
+        <h2>Consulta livre — escreva seu próprio SQL</h2>
+        <div class="subtitle">Só <code>SELECT</code> é permitido. Tabelas disponíveis: <code>trip_metrics</code> (agregada, leve) e <code>trips</code> (grão de corrida, ~200 MB — a primeira consulta nela demora mais).</div>
+      </div>
+    </div>
+    <textarea id="sql-input" rows="5" style="width:100%;font-family:monospace;font-size:12.5px;padding:12px;border:1px solid var(--line);border-radius:4px;resize:vertical;background:#fbfdff">SELECT tipo, ano_mes, ROUND(SUM(soma_total_amount) / SUM(qtd_corridas), 2) AS media_total_amount
+FROM trip_metrics
+GROUP BY tipo, ano_mes
+ORDER BY tipo, ano_mes</textarea>
+    <div style="margin-top:12px">
+      <button class="btn" id="btn-sql">Executar consulta</button>
+    </div>
+    <p class="warn" id="sql-warn"></p>
+    <div id="sql-result"></div>
+  </section>
+
+  <section class="adhoc">
+    <div class="adhoc-header">
+      <div>
         <h2>Consulta ad-hoc — grão de corrida individual</h2>
-        <div class="subtitle">Consulta direta em <code>gold.trips</code> (~200 MB em 4 arquivos Parquet). Carregada sob demanda porque é bem maior que a tabela agregada.</div>
+        <div class="subtitle">Consulta direta em <code>gold.trips</code> (~200 MB em 4 arquivos Parquet), filtrada para Yellow Cab — mesma população do gráfico acima. Carregada sob demanda porque é bem maior que a tabela agregada.</div>
       </div>
       <button class="btn" id="btn-adhoc">Carregar trips</button>
     </div>
@@ -154,6 +181,8 @@ async function boot() {
     conn = await db.connect();
 
     setStatus('loading', 'Consultando trip_metrics no S3...');
+    await conn.query(`CREATE VIEW trip_metrics AS SELECT * FROM read_parquet('${metricsUrl()}')`);
+    await conn.query(`CREATE VIEW trips AS SELECT * FROM read_parquet([${tripsUrlList()}])`);
     await runMetricsQueries();
 
     setStatus('ok', 'Dados carregados — consulta executada direto no S3, sem backend.');
@@ -171,14 +200,12 @@ function tripsUrlList() {
   return MANIFEST.trips.map(p => `'${MANIFEST.bucket_base_url}/${p}'`).join(', ');
 }
 
-async function runMetricsQueries() {
-  const url = metricsUrl();
-
+async function runMetricsQueries(tipo = 'yellow') {
   const q1 = await conn.query(`
     SELECT ano_mes,
            ROUND(SUM(soma_total_amount) / SUM(qtd_corridas), 2) AS media_total_amount
-    FROM read_parquet('${url}')
-    WHERE tipo = 'yellow'
+    FROM trip_metrics
+    ${tipo === 'todos' ? '' : `WHERE tipo = '${tipo}'`}
     GROUP BY ano_mes
     ORDER BY ano_mes
   `);
@@ -187,7 +214,7 @@ async function runMetricsQueries() {
   const q2 = await conn.query(`
     SELECT hora_do_dia,
            ROUND(SUM(soma_passenger_count) / SUM(qtd_corridas), 2) AS media_passenger_count
-    FROM read_parquet('${url}')
+    FROM trip_metrics
     WHERE ano_mes = '2023-05'
     GROUP BY hora_do_dia
     ORDER BY hora_do_dia
@@ -198,8 +225,13 @@ async function runMetricsQueries() {
   drawChart('chart-passengers', rows2.map(r => r.hora_do_dia), rows2.map(r => r.media_passenger_count), 'Média de passageiros');
 }
 
+const chartInstances = {};
+
 function drawChart(canvasId, labels, data, label) {
-  new Chart(document.getElementById(canvasId), {
+  if (chartInstances[canvasId]) {
+    chartInstances[canvasId].destroy();
+  }
+  chartInstances[canvasId] = new Chart(document.getElementById(canvasId), {
     type: 'bar',
     data: {
       labels,
@@ -223,6 +255,61 @@ function drawChart(canvasId, labels, data, label) {
   });
 }
 
+const TIPO_LABELS = { yellow: 'Yellow Cab', green: 'Green Cab', todos: 'Todos os tipos' };
+
+document.getElementById('tipo-select').addEventListener('change', async (e) => {
+  const tipo = e.target.value;
+  document.getElementById('chart-amount-subtitle').textContent = `${TIPO_LABELS[tipo]}, jan–mai/2023`;
+  await runMetricsQueries(tipo);
+});
+
+document.getElementById('btn-sql').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-sql');
+  const warnEl = document.getElementById('sql-warn');
+  const resultEl = document.getElementById('sql-result');
+  const sql = document.getElementById('sql-input').value.trim();
+
+  warnEl.textContent = '';
+  resultEl.innerHTML = '';
+
+  // Guarda simples: só permite consultas de leitura (SELECT / WITH ... SELECT)
+  const normalized = sql.replace(/;\s*$/, '').trim();
+  if (!/^(select|with)\b/i.test(normalized)) {
+    warnEl.textContent = 'Só são permitidas consultas SELECT (ou WITH ... SELECT).';
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = 'Executando...';
+
+  try {
+    const result = await conn.query(normalized);
+    const rows = result.toArray().map(r => r.toJSON());
+
+    if (rows.length === 0) {
+      resultEl.innerHTML = '<p class="warn">A consulta rodou, mas não retornou linhas.</p>';
+    } else {
+      const cols = Object.keys(rows[0]);
+      let html = '<table><thead><tr>' + cols.map(c => `<th>${c}</th>`).join('') + '</tr></thead><tbody>';
+      for (const r of rows.slice(0, 200)) {
+        html += '<tr>' + cols.map(c => `<td>${r[c] !== null && r[c] !== undefined ? r[c].toString() : ''}</td>`).join('') + '</tr>';
+      }
+      html += '</tbody></table>';
+      if (rows.length > 200) {
+        html += `<p class="warn">Mostrando as primeiras 200 de ${rows.length} linhas.</p>`;
+      }
+      resultEl.innerHTML = html;
+    }
+    btn.textContent = 'Executar consulta';
+  } catch (err) {
+    console.error(err);
+    warnEl.textContent = 'Erro na consulta: ' + err.message;
+    btn.textContent = 'Executar consulta';
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 document.getElementById('btn-adhoc').addEventListener('click', async () => {
   const btn = document.getElementById('btn-adhoc');
   const resultEl = document.getElementById('adhoc-result');
@@ -230,13 +317,13 @@ document.getElementById('btn-adhoc').addEventListener('click', async () => {
   btn.textContent = 'Carregando...';
 
   try {
-    const urls = tripsUrlList();
     const result = await conn.query(`
       SELECT ano_mes,
              COUNT(*) AS qtd_corridas,
              ROUND(AVG(total_amount), 2) AS media_total_amount,
              ROUND(AVG(passenger_count), 2) AS media_passenger_count
-      FROM read_parquet([${urls}])
+      FROM trips
+      WHERE tipo = 'yellow'
       GROUP BY ano_mes
       ORDER BY ano_mes
     `);
