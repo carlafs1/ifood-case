@@ -25,6 +25,7 @@ através do painel disponível no [site pessoal da autora](https://carlasampaio.
 
 - [Objetivo](#-objetivo)
 - [Arquitetura](#-arquitetura)
+- [Como o painel consulta os dados (S3 + CloudFront + DuckDB-Wasm)](#-como-o-painel-consulta-os-dados-s3--cloudfront--duckdb-wasm)
 - [Estrutura do repositório](#-estrutura-do-repositório)
 - [Decisões de negócio](#-decisões-de-negócio)
 - [Trade-offs de performance](#-trade-offs-de-performance)
@@ -63,6 +64,110 @@ Gold
 | **Bronze** | Preserva os arquivos originais e documenta divergências de schema entre meses (detectadas na auditoria, tratadas na Silver). |
 | **Silver** | Consolida Yellow e Green em um schema único e tipado, mantendo todas as colunas de origem para análises exploratórias além do escopo deste case. Schema completo em [`docs/data_dictionary.md`](docs/data_dictionary.md). |
 | **Gold** | Duas tabelas: `gold.trips` (grão individual, colunas exigidas pelo case, para consultas ad-hoc) e `gold.trip_metrics` (pré-agregada por tipo/mês/hora, guardando **soma e contagem** — não médias prontas — para responder as perguntas sem reprocessar a Silver e sem o problema de "média das médias"). |
+
+---
+
+## 🌐 Como o painel consulta os dados (S3 + CloudFront + DuckDB-Wasm)
+
+```
+Databricks (gold.trips / gold.trip_metrics — tabelas Delta)
+    │  Exportação manual para Parquet (ver detalhe abaixo)
+    ▼
+S3 — bucket ifood-case-data-715428148112 (PRIVADO, Block Public Access ativo)
+    │  Origin Access Control (OAC): só a distribuição CloudFront pode ler,
+    │  via s3:GetObject — sem ListBucket, sem escrita
+    ▼
+CloudFront — distribuição HTTPS pública
+    │  Serve os arquivos Parquet via HTTP range requests
+    ▼
+Navegador do visitante — DuckDB-Wasm (WebAssembly)
+    │  Lê os Parquet direto do CloudFront, executa SQL 100% no cliente,
+    │  sem nenhum servidor/backend no meio
+    ▼
+docs/painel.html — gráficos (Chart.js) + campo de SQL livre
+```
+
+**Por que essa exportação é manual, e não automática dentro do pipeline:**
+
+Foi avaliada uma conexão segura entre o **Databricks Community Edition** e o S3 via **STS**
+(credenciais temporárias), com o objetivo de automatizar a leitura/escrita direta no bucket a
+partir dos notebooks. As regras IAM foram validadas no console AWS e estavam consistentes; o
+teste de conexão pelo próprio Databricks também funcionou. No entanto, **a leitura via PySpark
+apresentava erro de forma consistente**. A investigação indicou que o **Databricks Community
+Edition não oferece suporte a acesso direto ao S3** nesse cenário — por isso a exportação da
+camada Gold para o S3 foi feita manualmente (célula a célula, fora do pipeline automatizado),
+em vez de programática.
+
+- **S3**: guarda os arquivos Parquet exportados manualmente da camada Gold — privado, sem
+  acesso direto.
+- **CloudFront**: única porta de entrada pública para esses arquivos, com HTTPS e cache.
+- **DuckDB-Wasm**: motor SQL que roda inteiramente no navegador de quem acessa o painel —
+  não existe backend nem servidor de consulta.
+
+<details>
+<summary>Detalhes técnicos completos (script de exportação, bucket, URLs diretas)</summary>
+<br>
+
+**Publicação da camada Gold no S3**: os dados de saída (tabelas Delta `gold.trips` e
+`gold.trip_metrics`) foram extraídos manualmente em formato Parquet, a partir de um Volume
+intermediário (`/Volumes/ifood_case/gold/export`), e carregados para o bucket S3:
+
+```python
+EXPORT_PATH = "/Volumes/ifood_case/gold/export"
+
+(
+    df_gold_metrics
+    .coalesce(1)
+    .write
+    .mode("overwrite")
+    .parquet(f"{EXPORT_PATH}/trip_metrics")
+)
+
+(
+    df_gold_trips
+    .repartition(5, "ano_mes")
+    .write
+    .mode("overwrite")
+    .parquet(f"{EXPORT_PATH}/trips")
+)
+```
+
+`trip_metrics` sai como um único arquivo (`coalesce(1)`), sem partições físicas — por isso o
+`docs/manifest.json` lista só 1 arquivo para essa tabela. `trips` usa
+`repartition(5, "ano_mes")`, que faz hash da coluna em 5 baldes; com exatamente 5 valores
+distintos de `ano_mes`, existe chance real de colisão de hash — foi o que ocorreu: dois meses
+caíram no mesmo balde (arquivo maior) e um balde ficou vazio (sem gerar arquivo), resultando
+em **4 arquivos publicados**, não 5. A tabela Delta original (`ifood_case.gold.trips`)
+continua com 5 arquivos internamente (`repartition("ano_mes")` na escrita da Silver, sem
+colisão nesse caso) — a divergência é específica deste passo de exportação manual, não da
+modelagem da camada Gold em si.
+
+**Bucket:** `ifood-case-data-715428148112` (região `us-east-2`)
+
+**URLs diretas (HTTPS via CloudFront, sem login necessário):**
+
+Tabela de métricas (`gold.trip_metrics`, agregada por tipo/mês/hora):
+```
+https://d2kktwauihnki.cloudfront.net/gold/trip_metrics/part-00000-tid-4160011368293954417-d573e3c2-b725-49ab-a216-7423ebde4919-227-1.c000.snappy.parquet
+```
+
+Tabela de corridas (`gold.trips`, grão individual, particionada por `ano_mes`, ~200 MB total,
+prefixo `https://d2kktwauihnki.cloudfront.net/gold/trips/`):
+
+| Arquivo | Tamanho |
+|---|---|
+| `part-00000-tid-2765581612056450840-...-233-1.c000.snappy.parquet` | 2,4 KB |
+| `part-00001-tid-2765581612056450840-...-237-1.c000.snappy.parquet` | 119,6 MB |
+| `part-00002-tid-2765581612056450840-...-234-1.c000.snappy.parquet` | 42,6 MB |
+| `part-00004-tid-2765581612056450840-...-236-1.c000.snappy.parquet` | — |
+
+Nomes completos e atualizados em [`docs/manifest.json`](docs/manifest.json).
+
+**Console AWS** *(referência interna, requer login na conta da autora)*:
+[Bucket](https://us-east-2.console.aws.amazon.com/s3/buckets/ifood-case-data-715428148112) ·
+[gold/](https://us-east-2.console.aws.amazon.com/s3/buckets/ifood-case-data-715428148112?prefix=gold/)
+
+</details>
 
 ---
 
@@ -156,7 +261,7 @@ local simples. Notebooks usam `spark` e `dbutils`, providos automaticamente pelo
 não há setup adicional necessário dentro do Databricks.
 
 <details>
-<summary><strong>⚠️ Limitações de ambiente e decisões de infraestrutura</strong></summary>
+<summary><strong>⚠️ Outras limitações de ambiente</strong></summary>
 <br>
 
 - **Ingestão dos dados brutos**: os arquivos originais (NYC TLC) foram carregados manualmente
@@ -166,86 +271,6 @@ não há setup adicional necessário dentro do Databricks.
   `persist()`** de DataFrames. Diversas ações de validação na Silver, portanto, reprocessam a
   partir da leitura dos parquets originais a cada execução — não por escolha de performance,
   mas por restrição da plataforma.
-- **Tentativa de conexão Databricks ↔ S3 via STS**: foi avaliada uma conexão segura entre o
-  Databricks Community Edition e o S3 via STS (credenciais temporárias), com o objetivo de
-  automatizar a leitura/escrita direta no bucket. As regras IAM foram validadas no console AWS
-  e estavam consistentes; o teste de conexão pelo próprio Databricks também funcionou. No
-  entanto, a leitura via PySpark apresentava erro de forma consistente. A investigação indicou
-  que o **Databricks Community Edition não oferece suporte a acesso direto ao S3** nesse
-  cenário — por isso a exportação da camada Gold para o S3 foi feita de forma manual (abaixo),
-  em vez de programática dentro do pipeline.
-- **Publicação da camada Gold no S3**: os dados de saída (tabelas Delta `gold.trips` e
-  `gold.trip_metrics`) foram extraídos manualmente em formato Parquet, a partir de um Volume
-  intermediário (`/Volumes/ifood_case/gold/export`), e carregados para o bucket S3:
-
-  ```python
-  EXPORT_PATH = "/Volumes/ifood_case/gold/export"
-
-  (
-      df_gold_metrics
-      .coalesce(1)
-      .write
-      .mode("overwrite")
-      .parquet(f"{EXPORT_PATH}/trip_metrics")
-  )
-
-  (
-      df_gold_trips
-      .repartition(5, "ano_mes")
-      .write
-      .mode("overwrite")
-      .parquet(f"{EXPORT_PATH}/trips")
-  )
-  ```
-
-  `trip_metrics` sai como um único arquivo (`coalesce(1)`), sem partições físicas — por isso o
-  `docs/manifest.json` lista só 1 arquivo para essa tabela. `trips` usa
-  `repartition(5, "ano_mes")`, que faz hash da coluna em 5 baldes; com exatamente 5 valores
-  distintos de `ano_mes`, existe chance real de colisão de hash — foi o que ocorreu: dois meses
-  caíram no mesmo balde (arquivo maior) e um balde ficou vazio (sem gerar arquivo), resultando
-  em **4 arquivos publicados**, não 5. A tabela Delta original (`ifood_case.gold.trips`)
-  continua com 5 arquivos internamente (`repartition("ano_mes")` na escrita da Silver, sem
-  colisão nesse caso) — a divergência é específica deste passo de exportação manual, não da
-  modelagem da camada Gold em si.
-
-</details>
-
-<details>
-<summary><strong>🔒 Como os dados ficam disponíveis publicamente (S3 + CloudFront)</strong></summary>
-<br>
-
-Os dados da camada Gold que alimentam o painel ficam publicados no CloudFront, com o seguinte
-modelo de acesso:
-
-> O bucket S3 é **privado** (Block Public Access ativo). A leitura pública acontece
-> exclusivamente através de uma distribuição **CloudFront**, configurada com **Origin Access
-> Control (OAC)** e uma bucket policy restrita a `s3:GetObject` — sem `ListBucket` e sem
-> qualquer permissão de escrita. O bucket S3 em si não responde a requisições diretas.
-
-**Bucket:** `ifood-case-data-715428148112` (região `us-east-2`)
-
-**URLs diretas (HTTPS via CloudFront, sem login necessário):**
-
-Tabela de métricas (`gold.trip_metrics`, agregada por tipo/mês/hora):
-```
-https://d2kktwauihnki.cloudfront.net/gold/trip_metrics/part-00000-tid-4160011368293954417-d573e3c2-b725-49ab-a216-7423ebde4919-227-1.c000.snappy.parquet
-```
-
-Tabela de corridas (`gold.trips`, grão individual, particionada por `ano_mes`, ~200 MB total,
-prefixo `https://d2kktwauihnki.cloudfront.net/gold/trips/`):
-
-| Arquivo | Tamanho |
-|---|---|
-| `part-00000-tid-2765581612056450840-...-233-1.c000.snappy.parquet` | 2,4 KB |
-| `part-00001-tid-2765581612056450840-...-237-1.c000.snappy.parquet` | 119,6 MB |
-| `part-00002-tid-2765581612056450840-...-234-1.c000.snappy.parquet` | 42,6 MB |
-| `part-00004-tid-2765581612056450840-...-236-1.c000.snappy.parquet` | — |
-
-Nomes completos e atualizados em [`docs/manifest.json`](docs/manifest.json).
-
-**Console AWS** *(referência interna, requer login na conta da autora)*:
-[Bucket](https://us-east-2.console.aws.amazon.com/s3/buckets/ifood-case-data-715428148112) ·
-[gold/](https://us-east-2.console.aws.amazon.com/s3/buckets/ifood-case-data-715428148112?prefix=gold/)
 
 </details>
 
