@@ -1,119 +1,147 @@
-# Case Técnico — Data Architect · iFood
+<div align="center">
 
-Pipeline de dados NYC TLC (Yellow/Green Cab) em arquitetura Medalhão (Bronze/Silver/Gold),
-implementado com PySpark e Delta Lake no Databricks.
+# 🚕 Case Técnico — Data Architect · iFood
 
-## Objetivo
+**Pipeline de dados NYC TLC (Yellow/Green Cab) em arquitetura Medalhão (Bronze → Silver → Gold)**
+
+![Databricks](https://img.shields.io/badge/Databricks-FF3621?style=flat&logo=databricks&logoColor=white)
+![PySpark](https://img.shields.io/badge/PySpark-E25A1C?style=flat&logo=apachespark&logoColor=white)
+![Delta Lake](https://img.shields.io/badge/Delta%20Lake-00ADD8?style=flat)
+![AWS S3](https://img.shields.io/badge/AWS%20S3-569A31?style=flat&logo=amazons3&logoColor=white)
+![CloudFront](https://img.shields.io/badge/CloudFront-232F3E?style=flat&logo=amazonaws&logoColor=white)
+![DuckDB](https://img.shields.io/badge/DuckDB--Wasm-FFF000?style=flat&logo=duckdb&logoColor=black)
+
+</div>
+
+<br>
+
+Os dados deste case podem ser consultados de forma interativa, sem sair do navegador,
+através do painel disponível no [site pessoal da autora](https://carlasampaio.com.br):
+**carlasampaio.com.br** → **Projetos** → **Case iFood**.
+
+---
+
+## 📑 Sumário
+
+- [Objetivo](#-objetivo)
+- [Arquitetura](#-arquitetura)
+- [Estrutura do repositório](#-estrutura-do-repositório)
+- [Decisões de negócio](#-decisões-de-negócio)
+- [Trade-offs de performance](#-trade-offs-de-performance)
+- [Perguntas de negócio respondidas](#-perguntas-de-negócio-respondidas)
+- [Dicionário de dados](#-dicionário-de-dados)
+- [Ambiente e execução](#-ambiente-e-execução)
+- [Como navegar este repositório](#-como-navegar-este-repositório)
+
+---
+
+## 🎯 Objetivo
 
 Ingerir os dados de corridas de táxi de NY (jan-mai/2023), disponibilizá-los para consumo via
 SQL, e responder duas perguntas de negócio sobre a frota.
 
-## Estrutura do repositório
+---
+
+## 🏗️ Arquitetura
+
+```
+Bronze (/Volumes/ifood_case/bronze/raw - Parquet brutos)
+    │  Leitura individual por arquivo, validação de contagem/schema,
+    │  auditoria de divergência de tipos entre meses
+    ▼
+Silver (ifood_case.silver.trips)
+    │  União Yellow + Green Cab, padronização de schema e nomenclatura
+    │  Tratamento: nulos, timestamps invertidos, período inválido, duplicatas
+    ▼
+Gold
+    ├── ifood_case.gold.trips          → grão de corrida individual (consumo)
+    └── ifood_case.gold.trip_metrics   → grão agregado (tipo, ano_mes, hora_do_dia)
+```
+
+| Camada | O que faz |
+|---|---|
+| **Bronze** | Preserva os arquivos originais e documenta divergências de schema entre meses (detectadas na auditoria, tratadas na Silver). |
+| **Silver** | Consolida Yellow e Green em um schema único e tipado, mantendo todas as colunas de origem para análises exploratórias além do escopo deste case. Schema completo em [`docs/data_dictionary.md`](docs/data_dictionary.md). |
+| **Gold** | Duas tabelas: `gold.trips` (grão individual, colunas exigidas pelo case, para consultas ad-hoc) e `gold.trip_metrics` (pré-agregada por tipo/mês/hora, guardando **soma e contagem** — não médias prontas — para responder as perguntas sem reprocessar a Silver e sem o problema de "média das médias"). |
+
+---
+
+## 🗂️ Estrutura do repositório
 
 ```
 ifood-case/
-├─ src/                     # Pipeline de ingestao e transformacao
-│  ├─ 01_bronze.ipynb       # Ingestao e auditoria dos dados brutos
-│  ├─ 02_Silver.ipynb       # Padronizacao, qualidade e tratamento de dados
-│  └─ 03_Gold.ipynb         # Modelagem da camada de consumo
-├─ analysis/                # Respostas as perguntas de negocio do case
+├─ src/                        # Pipeline de ingestão e transformação
+│  ├─ 01_bronze.ipynb          # Ingestão e auditoria dos dados brutos
+│  ├─ 02_Silver.ipynb          # Padronização, qualidade e tratamento de dados
+│  └─ 03_Gold.ipynb            # Modelagem da camada de consumo e exportação para S3
+├─ analysis/                   # Respostas às perguntas de negócio do case
 │  └─ 01_perguntas.ipynb
 ├─ docs/
-│  └─ data_dictionary.md    # Dicionario de dados completo (schema Silver)
+│  ├─ data_dictionary.md       # Dicionário de dados completo (schema Silver)
+│  ├─ manifest.json            # Índice dos arquivos Parquet publicados no S3/CloudFront
+│  └─ painel.html              # Painel web (DuckDB-Wasm) para consulta interativa dos dados
 ├─ README.md
 └─ requirements.txt
 ```
 
-## Arquitetura
+> O painel (`docs/painel.html`) está disponível através do
+> [site pessoal da autora](https://carlasampaio.com.br), na seção "Projetos".
 
-```
-Bronze (/Volumes/ifood_case/bronze/raw - Parquet brutos)
-    |  Leitura individual por arquivo, validacao de contagem/schema,
-    |  auditoria de divergencia de tipos entre meses
-    v
-Silver (ifood_case.silver.trips)
-    |  Uniao Yellow + Green Cab, padronizacao de schema e nomenclatura
-    |  Tratamento: nulos, timestamps invertidos, periodo invalido, duplicatas
-    v
-Gold
-    +-- ifood_case.gold.trips          - grao de corrida individual (consumo)
-    +-- ifood_case.gold.trip_metrics   - grao agregado (tipo, ano_mes, hora_do_dia)
-```
+---
 
-**Bronze** preserva os arquivos originais e documenta divergências de schema entre meses
-(detectadas na auditoria, tratadas na Silver).
+## 🧭 Decisões de negócio
 
-**Silver** consolida Yellow e Green em um schema único e tipado, mantendo todas as colunas de
-origem para suportar análises exploratórias adicionais além do escopo deste case. Schema
-completo documentado em [`docs/data_dictionary.md`](docs/data_dictionary.md).
+As decisões de tratamento de dados (outliers, valores negativos, nulos, timestamps invertidos,
+duplicatas, entre outras) estão completamente documentadas — com critério aplicado e evidência
+(contagens, distribuições) — diretamente no código, célula a célula, em `src/02_Silver.ipynb`.
 
-**Gold** tem duas tabelas com propósitos diferentes:
-- `gold.trips`, no grão de corrida individual, com as colunas exigidas pelo case
-  (`VendorID`, `passenger_count`, `total_amount`, `pickup_datetime`, `dropoff_datetime`),
-  para consultas ad-hoc não previstas neste case;
-- `gold.trip_metrics`, pré-agregada por tipo de táxi/mês/hora, armazenando **soma e contagem**
-  (não médias prontas) para responder as perguntas de negócio sem reprocessar a Silver a cada
-  consulta, e sem o problema de "média das médias" ao recombinar em granularidades diferentes.
+---
 
-## Decisões de negócio
+## ⚡ Trade-offs de performance
 
-- **Outliers de `total_amount`** (critério IQR): mantidos — justificados por corridas de maior
-  duração, não por erro de dado.
-- **`total_amount` negativo**: mantido — associado a uma regra de negócio específica do
-  `VendorID = 2`, confirmada batendo o valor total com a soma dos componentes financeiros.
-- **Nulos em `passenger_count`** (2,73% dos registros): imputados pela mediana.
-- **Timestamps invertidos** (`dropoff_datetime` < `pickup_datetime`): corrigidos via
-  `least`/`greatest`, preservados em `pickup_datetime_tratado`/`dropoff_datetime_tratado`.
+| Decisão | Motivo |
+|---|---|
+| `percentile_approx` em vez de `percentile` | Usado para todos os cálculos de quantis (mediana de `passenger_count`, quartis de `total_amount` para IQR), evitando o custo de ordenação completa exigido pelo cálculo exato — irrelevante para as decisões tomadas a partir desses valores. |
+| `repartition("ano_mes")` antes da escrita | Evita small files dentro de cada partição física, alinhando o número de arquivos de saída ao número real de partições lógicas (5 meses), em vez do paralelismo default (200 partições de shuffle). |
+| `coalesce(1)` na tabela de métricas | Volume agregado pequeno (~240 linhas): evita o custo de shuffle do `repartition`, consolidando direto em um único arquivo por partição. |
+| `OPTIMIZE ... ZORDER` | Aplicado em `silver.trips` (por `data_corrida`) e `gold.trips` (por `pickup_datetime`) — colunas de filtro comum dentro de uma partição já selecionada por `ano_mes`. Não aplicado em `gold.trip_metrics` por já ser pequena o suficiente. |
+| Sem checkpoint intermediário | Não usamos porque o volume de dados e a estrutura leve, simples e linear do pipeline dispensavam. |
+| Auditoria de schema no Bronze | Leitura individual por arquivo é necessária (schemas divergem entre meses), mas as estatísticas de cada arquivo são calculadas em uma única ação Spark (`agg_exprs` combinado), em vez de uma ação por coluna. |
 
-Detalhes completos de cada decisão, com evidência (contagens, distribuições), estão nos outputs
-já executados dentro de `src/02_Silver.ipynb`.
+---
 
-## Trade-offs de performance
-
-- **`percentile_approx` em vez de `percentile`**: usado consistentemente para cálculos de
-  quantis (mediana de `passenger_count`, quartis de `total_amount` para o IQR), evitando o
-  custo de ordenação completa exigido pelo cálculo exato — irrelevante para as decisões de
-  negócio tomadas a partir desses valores.
-- **`repartition("ano_mes")` antes da escrita** (Silver e `gold.trips`): evita o problema de
-  small files dentro de cada partição física, alinhando o número de arquivos de saída ao
-  número real de partições lógicas (5 meses), em vez de depender do paralelismo default de
-  processamento (200 partições de shuffle).
-- **`coalesce(1)` na tabela de métricas**: como o volume agregado é pequeno (~240 linhas), evita
-  o custo de shuffle do `repartition`, consolidando direto em um único arquivo por partição sem
-  redistribuir dados pela rede.
-- **`OPTIMIZE ... ZORDER`**: aplicado em `silver.trips` (por `data_corrida`) e `gold.trips`
-  (por `pickup_datetime`) — colunas de filtro comum dentro de uma partição já selecionada por
-  `ano_mes`. Não aplicado em `gold.trip_metrics` por ser pequena o suficiente para não ter
-  ganho de otimização física.
-- **Sem cache/checkpoint intermediário**: diversas ações de validação na Silver reprocessam a
-  partir da leitura dos parquets originais. Para o volume deste case (5 meses de NYC TLC), o
-  custo de reprocessar é aceitável frente à complexidade de um checkpoint intermediário; em um
-  cenário de maior escala, essa seria a próxima otimização a avaliar.
-- **Auditoria de schema no Bronze**: leitura individual por arquivo é necessária (schemas
-  divergem entre meses), mas as estatísticas de cada arquivo são calculadas em uma única ação
-  Spark por arquivo (`agg_exprs` combinado), em vez de uma ação por coluna.
-
-## Perguntas de negócio respondidas
+## ❓ Perguntas de negócio respondidas
 
 1. Qual a média de valor total (`total_amount`) recebido em um mês, considerando todos os
    yellow táxis da frota?
 2. Qual a média de passageiros (`passenger_count`) por hora do dia no mês de maio,
    considerando todos os táxis da frota?
 
-Consultas e resultados em `analysis/01_respostas.ipynb` (também presentes em `src/03_Gold.ipynb`,
-como parte do fluxo de construção da camada Gold).
+**Onde encontrar as respostas:**
 
-## Dicionário de dados
+| Onde | O quê |
+|---|---|
+| 📊 Painel interativo | Disponível no [site pessoal da autora](https://carlasampaio.com.br) (Projetos → Case iFood) — os dois gráficos já respondem as perguntas acima, mais consulta SQL livre |
+| 📓 `analysis/01_perguntas.ipynb` | Respostas isoladas |
+| 📓 `src/03_Gold.ipynb` | Como parte do fluxo de construção da camada Gold |
+| 📁 [`src/`](src/) | Pipeline completo que gera os dados por trás das respostas |
+
+---
+
+## 📖 Dicionário de dados
 
 Schema completo da camada Silver, com descrição de cada coluna traduzida fielmente dos
 dicionários oficiais do TLC, domínio de valores e linhagem:
 [`docs/data_dictionary.md`](docs/data_dictionary.md).
 
-As mesmas descrições estão registradas como metadado de catálogo (`COMMENT ON COLUMN`) nas
-tabelas `silver.trips`, `gold.trips` e `gold.trip_metrics`, visíveis no Catalog Explorer do
-Databricks.
+A linhagem (origem de cada coluna, transformações aplicadas Bronze → Silver → Gold) está
+documentada como metadado de catálogo (`COMMENT ON COLUMN`) diretamente nas tabelas
+`silver.trips`, `gold.trips` e `gold.trip_metrics`, visível no Catalog Explorer do Databricks —
+e reproduzida integralmente no arquivo Markdown acima, para consulta fora do ambiente Databricks.
 
-## Ambiente e execução
+---
+
+## 🛠️ Ambiente e execução
 
 Desenvolvido e executado no **Databricks** (Spark 4.1.0), com Delta Lake nativo do runtime.
 
@@ -127,9 +155,110 @@ depende de configuração adicional do ambiente Databricks, fora do escopo de um
 local simples. Notebooks usam `spark` e `dbutils`, providos automaticamente pelo runtime —
 não há setup adicional necessário dentro do Databricks.
 
-**Como navegar este repositório:**
-1. `src/01_bronze.ipynb` — ingestão e auditoria de divergência de schema
-2. `src/02_Silver.ipynb` — tratamento de qualidade de dados, célula a célula, com evidência
-3. `src/03_Gold.ipynb` — modelagem de consumo e respostas às perguntas de negócio
-4. `analysis/01_respostas.ipynb` — respostas às perguntas de negócio, isoladas
-5. `docs/data_dictionary.md` — referência de schema, quando necessário durante a leitura
+<details>
+<summary><strong>⚠️ Limitações de ambiente e decisões de infraestrutura</strong></summary>
+<br>
+
+- **Ingestão dos dados brutos**: os arquivos originais (NYC TLC) foram carregados manualmente
+  para um Volume criado na camada Bronze do Databricks (`/Volumes/ifood_case/bronze/raw`), em
+  vez de uma ingestão automatizada a partir de uma origem externa.
+- **Sem cache intermediário**: o **Databricks Community Edition não permite `cache()`/
+  `persist()`** de DataFrames. Diversas ações de validação na Silver, portanto, reprocessam a
+  partir da leitura dos parquets originais a cada execução — não por escolha de performance,
+  mas por restrição da plataforma.
+- **Tentativa de conexão Databricks ↔ S3 via STS**: foi avaliada uma conexão segura entre o
+  Databricks Community Edition e o S3 via STS (credenciais temporárias), com o objetivo de
+  automatizar a leitura/escrita direta no bucket. As regras IAM foram validadas no console AWS
+  e estavam consistentes; o teste de conexão pelo próprio Databricks também funcionou. No
+  entanto, a leitura via PySpark apresentava erro de forma consistente. A investigação indicou
+  que o **Databricks Community Edition não oferece suporte a acesso direto ao S3** nesse
+  cenário — por isso a exportação da camada Gold para o S3 foi feita de forma manual (abaixo),
+  em vez de programática dentro do pipeline.
+- **Publicação da camada Gold no S3**: os dados de saída (tabelas Delta `gold.trips` e
+  `gold.trip_metrics`) foram extraídos manualmente em formato Parquet, a partir de um Volume
+  intermediário (`/Volumes/ifood_case/gold/export`), e carregados para o bucket S3:
+
+  ```python
+  EXPORT_PATH = "/Volumes/ifood_case/gold/export"
+
+  (
+      df_gold_metrics
+      .coalesce(1)
+      .write
+      .mode("overwrite")
+      .parquet(f"{EXPORT_PATH}/trip_metrics")
+  )
+
+  (
+      df_gold_trips
+      .repartition(5, "ano_mes")
+      .write
+      .mode("overwrite")
+      .parquet(f"{EXPORT_PATH}/trips")
+  )
+  ```
+
+  `trip_metrics` sai como um único arquivo (`coalesce(1)`), sem partições físicas — por isso o
+  `docs/manifest.json` lista só 1 arquivo para essa tabela. `trips` usa
+  `repartition(5, "ano_mes")`, que faz hash da coluna em 5 baldes; com exatamente 5 valores
+  distintos de `ano_mes`, existe chance real de colisão de hash — foi o que ocorreu: dois meses
+  caíram no mesmo balde (arquivo maior) e um balde ficou vazio (sem gerar arquivo), resultando
+  em **4 arquivos publicados**, não 5. A tabela Delta original (`ifood_case.gold.trips`)
+  continua com 5 arquivos internamente (`repartition("ano_mes")` na escrita da Silver, sem
+  colisão nesse caso) — a divergência é específica deste passo de exportação manual, não da
+  modelagem da camada Gold em si.
+
+</details>
+
+<details>
+<summary><strong>🔒 Como os dados ficam disponíveis publicamente (S3 + CloudFront)</strong></summary>
+<br>
+
+Os dados da camada Gold que alimentam o painel ficam publicados no CloudFront, com o seguinte
+modelo de acesso:
+
+> O bucket S3 é **privado** (Block Public Access ativo). A leitura pública acontece
+> exclusivamente através de uma distribuição **CloudFront**, configurada com **Origin Access
+> Control (OAC)** e uma bucket policy restrita a `s3:GetObject` — sem `ListBucket` e sem
+> qualquer permissão de escrita. O bucket S3 em si não responde a requisições diretas.
+
+**Bucket:** `ifood-case-data-715428148112` (região `us-east-2`)
+
+**URLs diretas (HTTPS via CloudFront, sem login necessário):**
+
+Tabela de métricas (`gold.trip_metrics`, agregada por tipo/mês/hora):
+```
+https://d2kktwauihnki.cloudfront.net/gold/trip_metrics/part-00000-tid-4160011368293954417-d573e3c2-b725-49ab-a216-7423ebde4919-227-1.c000.snappy.parquet
+```
+
+Tabela de corridas (`gold.trips`, grão individual, particionada por `ano_mes`, ~200 MB total,
+prefixo `https://d2kktwauihnki.cloudfront.net/gold/trips/`):
+
+| Arquivo | Tamanho |
+|---|---|
+| `part-00000-tid-2765581612056450840-...-233-1.c000.snappy.parquet` | 2,4 KB |
+| `part-00001-tid-2765581612056450840-...-237-1.c000.snappy.parquet` | 119,6 MB |
+| `part-00002-tid-2765581612056450840-...-234-1.c000.snappy.parquet` | 42,6 MB |
+| `part-00004-tid-2765581612056450840-...-236-1.c000.snappy.parquet` | — |
+
+Nomes completos e atualizados em [`docs/manifest.json`](docs/manifest.json).
+
+**Console AWS** *(referência interna, requer login na conta da autora)*:
+[Bucket](https://us-east-2.console.aws.amazon.com/s3/buckets/ifood-case-data-715428148112) ·
+[gold/](https://us-east-2.console.aws.amazon.com/s3/buckets/ifood-case-data-715428148112?prefix=gold/)
+
+</details>
+
+---
+
+## 🧩 Como navegar este repositório
+
+| Ordem | Arquivo | Conteúdo |
+|---|---|---|
+| 1 | `src/01_bronze.ipynb` | Ingestão e auditoria de divergência de schema |
+| 2 | `src/02_Silver.ipynb` | Tratamento de qualidade de dados, célula a célula, com evidência |
+| 3 | `src/03_Gold.ipynb` | Modelagem de consumo, respostas às perguntas de negócio e exportação para o S3 |
+| 4 | `analysis/01_perguntas.ipynb` | Respostas às perguntas de negócio, isoladas |
+| 5 | `docs/data_dictionary.md` | Referência de schema, quando necessário durante a leitura |
+| 6 | `docs/manifest.json` | Índice dos arquivos Parquet publicados (usado pelo painel e disponível para consulta manual) |
+| 7 | `docs/painel.html` | Painel interativo (DuckDB-Wasm), acessível pelo [site pessoal da autora](https://carlasampaio.com.br) |
