@@ -1,0 +1,12 @@
+{
+  "bucket_base_url": "https://d2kktwauihnki.cloudfront.net",
+  "trip_metrics": [
+    "gold/trip_metrics/part-00000-tid-4160011368293954417-d573e3c2-b725-49ab-a216-7423ebde4919-227-1.c000.snappy.parquet"
+  ],
+  "trips": [
+    "gold/trips/part-00000-tid-2765581612056450840-5817d2d6-c982-4466-9470-a8e56c6496d2-233-1.c000.snappy.parquet",
+    "gold/trips/part-00001-tid-2765581612056450840-5817d2d6-c982-4466-9470-a8e56c6496d2-237-1.c000.snappy.parquet",
+    "gold/trips/part-00002-tid-2765581612056450840-5817d2d6-c982-4466-9470-a8e56c6496d2-234-1.c000.snappy.parquet",
+    "gold/trips/part-00004-tid-2765581612056450840-5817d2d6-c982-4466-9470-a8e56c6496d2-236-1.c000.snappy.parquet"
+  ]
+}
