@@ -105,7 +105,7 @@ em vez de programática.
   não existe backend nem servidor de consulta.
 
 <details>
-<summary>Detalhes técnicos completos (script de exportação, bucket, URLs diretas)</summary>
+<summary>🔧 <strong>Quer ver o código exato, o bucket e as URLs?</strong> <img src="https://img.shields.io/badge/Clique_para_abrir-Detalhes_t%C3%A9cnicos-0969DA" alt="Clique para abrir os detalhes técnicos"></summary>
 <br>
 
 **Publicação da camada Gold no S3**: os dados de saída (tabelas Delta `gold.trips` e
